@@ -6,6 +6,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import struct
 import sys
 import tempfile
 import zlib
@@ -30,8 +31,6 @@ RULE = "#e4b2a4"
 NUM = "#9c341f"
 FOCUS = "#ffb15a"
 LINE = "#3c342c"
-
-DIM_TABLE = bytes((value * 45) // 100 for value in range(256))
 
 SRCCOPY = 0x00CC0020
 CAPTUREBLT = 0x40000000
@@ -95,6 +94,25 @@ def clamp_rect(x: int, y: int, width: int, height: int, bounds, min_size: int = 
     if cw < min_size or ch < min_size:
         return None
     return int(x0), int(y0), int(cw), int(ch)
+
+
+def is_whole_screen(rect, bounds, slack: int = 4) -> bool:
+    if not rect or not bounds:
+        return False
+    _x, _y, width, height = rect
+    _bx, _by, bounds_w, bounds_h = bounds
+    if bounds_w < MIN_CROP or bounds_h < MIN_CROP:
+        return False
+    return width >= bounds_w - slack and height >= bounds_h - slack
+
+
+def accept_capture(rect, bounds) -> bool:
+    if not rect:
+        return False
+    _x, _y, width, height = rect
+    if width < MIN_CROP or height < MIN_CROP:
+        return False
+    return not is_whole_screen(rect, bounds)
 
 
 def crop_rgb(rgb: bytes, width: int, height: int, x: int, y: int, cw: int, ch: int) -> bytes:
@@ -524,10 +542,251 @@ def capture_rect(x: int, y: int, width: int, height: int):
         user32.ReleaseDC(0, screen)
 
 
-def capture_screen():
-    x, y, width, height = virtual_screen()
-    rgb, width, height = capture_rect(x, y, width, height)
-    return x, y, rgb, width, height
+IMAGE_EXTENSIONS = {".png", ".bmp", ".jpg", ".jpeg"}
+
+
+def _paeth(left: int, up: int, up_left: int) -> int:
+    estimate = left + up - up_left
+    distance_left = abs(estimate - left)
+    distance_up = abs(estimate - up)
+    distance_up_left = abs(estimate - up_left)
+    if distance_left <= distance_up and distance_left <= distance_up_left:
+        return left
+    if distance_up <= distance_up_left:
+        return up
+    return up_left
+
+
+def decode_png(data: bytes):
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("png")
+    position = 8
+    width = height = bit_depth = color_type = None
+    palette = None
+    compressed = []
+    while position + 8 <= len(data):
+        length = struct.unpack_from(">I", data, position)[0]
+        position += 4
+        kind = data[position : position + 4]
+        position += 4
+        chunk = data[position : position + length]
+        position += length + 4
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(
+                ">IIBBBBB", chunk
+            )
+            if compression != 0 or filter_method != 0 or interlace != 0 or bit_depth != 8:
+                raise ValueError("png")
+            if color_type not in (0, 2, 3, 6):
+                raise ValueError("png")
+        elif kind == b"PLTE":
+            palette = chunk
+        elif kind == b"IDAT":
+            compressed.append(chunk)
+        elif kind == b"IEND":
+            break
+    if not width or not height or not compressed:
+        raise ValueError("png")
+    channels = {0: 1, 2: 3, 3: 1, 6: 4}[color_type]
+    stride = width * channels
+    raw = zlib.decompress(b"".join(compressed))
+    expected = height * (stride + 1)
+    if len(raw) < expected:
+        raise ValueError("png")
+    rows = []
+    cursor = 0
+    previous = bytearray(stride)
+    for _row in range(height):
+        filter_type = raw[cursor]
+        cursor += 1
+        row = bytearray(raw[cursor : cursor + stride])
+        cursor += stride
+        if filter_type == 1:
+            for index in range(stride):
+                left = row[index - channels] if index >= channels else 0
+                row[index] = (row[index] + left) & 255
+        elif filter_type == 2:
+            for index in range(stride):
+                row[index] = (row[index] + previous[index]) & 255
+        elif filter_type == 3:
+            for index in range(stride):
+                left = row[index - channels] if index >= channels else 0
+                row[index] = (row[index] + ((left + previous[index]) // 2)) & 255
+        elif filter_type == 4:
+            for index in range(stride):
+                left = row[index - channels] if index >= channels else 0
+                up_left = previous[index - channels] if index >= channels else 0
+                row[index] = (row[index] + _paeth(left, previous[index], up_left)) & 255
+        elif filter_type != 0:
+            raise ValueError("png")
+        previous = row
+        rows.append(row)
+    rgb = bytearray(width * height * 3)
+    dest = 0
+    for row in rows:
+        if color_type == 2:
+            rgb[dest : dest + stride] = row
+            dest += stride
+        elif color_type == 6:
+            for index in range(0, stride, 4):
+                rgb[dest : dest + 3] = row[index : index + 3]
+                dest += 3
+        elif color_type == 0:
+            for index in range(width):
+                value = row[index]
+                rgb[dest : dest + 3] = bytes((value, value, value))
+                dest += 3
+        else:
+            if palette is None:
+                raise ValueError("png")
+            for index in range(width):
+                offset = row[index] * 3
+                rgb[dest : dest + 3] = palette[offset : offset + 3]
+                dest += 3
+    return bytes(rgb), width, height
+
+
+def decode_bmp(data: bytes):
+    if data[:2] != b"BM" or len(data) < 54:
+        raise ValueError("bmp")
+    pixel_offset = struct.unpack_from("<I", data, 10)[0]
+    width, height = struct.unpack_from("<ii", data, 18)
+    _planes, bit_count = struct.unpack_from("<HH", data, 26)
+    compression = struct.unpack_from("<I", data, 30)[0]
+    top_down = height < 0
+    height = abs(height)
+    if width <= 0 or height <= 0 or bit_count not in (24, 32) or compression not in (0, 3):
+        raise ValueError("bmp")
+    stride = ((width * bit_count + 31) // 32) * 4
+    rgb = bytearray(width * height * 3)
+    for row_index in range(height):
+        source_row = row_index if top_down else height - 1 - row_index
+        start = pixel_offset + source_row * stride
+        dest = row_index * width * 3
+        if bit_count == 24:
+            for column in range(width):
+                offset = start + column * 3
+                blue, green, red = data[offset : offset + 3]
+                rgb[dest : dest + 3] = bytes((red, green, blue))
+                dest += 3
+        else:
+            for column in range(width):
+                offset = start + column * 4
+                blue, green, red = data[offset : offset + 3]
+                rgb[dest : dest + 3] = bytes((red, green, blue))
+                dest += 3
+    return bytes(rgb), width, height
+
+
+def load_image_file(path: str):
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return decode_png(data)
+    if data.startswith(b"BM"):
+        return decode_bmp(data)
+    raise ValueError("formato")
+
+
+def screenshot_directories(home=None, include_env: bool = True):
+    if home is None:
+        home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Pictures", "Screenshots"),
+        os.path.join(home, "OneDrive", "Pictures", "Screenshots"),
+    ]
+    if include_env:
+        for key in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            root = os.environ.get(key)
+            if root:
+                candidates.append(os.path.join(root, "Pictures", "Screenshots"))
+    try:
+        for entry in os.listdir(home):
+            if entry.lower().startswith("onedrive"):
+                candidates.append(os.path.join(home, entry, "Pictures", "Screenshots"))
+    except OSError:
+        pass
+    found = []
+    seen = set()
+    for path in candidates:
+        if not path or not os.path.isdir(path):
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+    return found
+
+
+class ScreenshotWatch:
+    def __init__(self, directory_fn):
+        self.directory_fn = directory_fn
+        self.folders = []
+        self.known = set()
+        self.seen = set()
+        self.pending = {}
+        self.failures = {}
+        self._discover(seed=True)
+
+    def _key(self, path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def _list_folder(self, folder: str):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return []
+        paths = []
+        for name in names:
+            if os.path.splitext(name)[1].lower() not in IMAGE_EXTENSIONS:
+                continue
+            paths.append(os.path.join(folder, name))
+        return paths
+
+    def _discover(self, seed: bool):
+        for folder in self.directory_fn():
+            key = os.path.normcase(os.path.abspath(folder))
+            if key in self.known:
+                continue
+            self.known.add(key)
+            self.folders.append(folder)
+            if seed:
+                for path in self._list_folder(folder):
+                    self.seen.add(self._key(path))
+
+    def retry_later(self, path: str):
+        key = self._key(path)
+        count = self.failures.get(key, 0) + 1
+        self.failures[key] = count
+        if count < 5:
+            self.seen.discard(key)
+            self.pending.pop(key, None)
+
+    def poll(self):
+        self._discover(seed=True)
+        ready = []
+        for folder in self.folders:
+            for path in self._list_folder(folder):
+                key = self._key(path)
+                if key in self.seen:
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                    modified = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if size <= 0:
+                    continue
+                signature = (size, modified)
+                if self.pending.get(key) != signature:
+                    self.pending[key] = signature
+                    continue
+                self.seen.add(key)
+                self.pending.pop(key, None)
+                ready.append(path)
+        ready.sort(key=lambda path: (os.path.getmtime(path), os.path.basename(path).lower()))
+        return ready
 
 
 def enable_dpi_awareness():
@@ -704,21 +963,23 @@ def place_book(root):
 
 
 class SnipOverlay:
-    def __init__(self, root, rgb: bytes, width: int, height: int, origin, on_done, on_cancel):
-        self.rgb = rgb
-        self.img_w = width
-        self.img_h = height
-        self.origin = origin
+    """Dim the screen and return only the rectangle the pointer dragged."""
+
+    def __init__(self, root, bounds, on_done, on_cancel):
+        self.bounds = bounds
         self.on_done = on_done
         self.on_cancel = on_cancel
         self.finished = False
         self.start = None
+        origin_x, origin_y, width, height = bounds
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.configure(bg="black", cursor="crosshair")
-        dim = rgb.translate(DIM_TABLE)
-        self.photo = photo_from_rgb(dim, width, height)
+        try:
+            self.win.attributes("-alpha", 0.35)
+        except tk.TclError:
+            pass
         self.canvas = tk.Canvas(
             self.win,
             width=width,
@@ -728,8 +989,7 @@ class SnipOverlay:
             bg="black",
             cursor="crosshair",
         )
-        self.canvas.pack()
-        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.canvas.pack(fill="both", expand=True)
         self.canvas.create_rectangle(0, height - 44, width, height, fill=BG, outline="", tags="hint")
         self.canvas.create_text(
             width / 2,
@@ -739,12 +999,13 @@ class SnipOverlay:
             font=("Segoe UI", 14),
             tags="hint",
         )
-        place_window(self.win, origin[0], origin[1], width, height)
-        self.canvas.bind("<ButtonPress-1>", self.press)
-        self.canvas.bind("<B1-Motion>", self.motion)
-        self.canvas.bind("<ButtonRelease-1>", self.release)
-        self.win.bind("<Escape>", self.cancel)
-        self.canvas.bind("<ButtonPress-3>", self.cancel)
+        place_window(self.win, origin_x, origin_y, width, height)
+        for target in (self.win, self.canvas):
+            target.bind("<ButtonPress-1>", self.press)
+            target.bind("<B1-Motion>", self.motion)
+            target.bind("<ButtonRelease-1>", self.release)
+            target.bind("<Escape>", self.cancel)
+            target.bind("<ButtonPress-3>", self.cancel)
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
         self.win.after(30, self._focus)
 
@@ -758,92 +1019,89 @@ class SnipOverlay:
         except tk.TclError:
             pass
 
-    def _clamp(self, x: int, y: int):
-        x = max(0, min(self.img_w - 1, int(x)))
-        y = max(0, min(self.img_h - 1, int(y)))
-        return x, y
+    def _pointer(self):
+        return self.win.winfo_pointerx(), self.win.winfo_pointery()
 
-    def _point(self, event):
-        if getattr(event, "widget", None) is self.canvas:
-            return self._clamp(event.x, event.y)
-        x = self.win.winfo_pointerx() - self.canvas.winfo_rootx()
-        y = self.win.winfo_pointery() - self.canvas.winfo_rooty()
-        return self._clamp(x, y)
+    def _canvas_xy(self, sx: int, sy: int):
+        return sx - self.canvas.winfo_rootx(), sy - self.canvas.winfo_rooty()
 
-    def press(self, event):
+    def press(self, _event=None):
         if self.finished:
             return
         self.canvas.delete("hint")
-        self.start = self._point(event)
+        self.start = self._pointer()
         self._draw(self.start, self.start)
 
-    def motion(self, event):
+    def motion(self, _event=None):
         if self.finished or self.start is None:
             return
-        self._draw(self.start, self._point(event))
+        self._draw(self.start, self._pointer())
 
     def _draw(self, start, current):
-        x0, y0 = start
-        x1, y1 = current
+        x0, y0 = self._canvas_xy(*start)
+        x1, y1 = self._canvas_xy(*current)
         self.canvas.delete("sel")
         self.canvas.create_rectangle(x0, y0, x1, y1, outline=FOCUS, width=3, tags="sel")
         label_x = min(x0, x1) + 8
         label_y = min(y0, y1) - 8
         anchor = "sw"
-        if label_y < 52:
+        if label_y < 8:
             label_y = max(y0, y1) + 8
             anchor = "nw"
         self.canvas.create_text(
             label_x,
             label_y,
             anchor=anchor,
-            text=f"{abs(x1 - x0) + 1} × {abs(y1 - y0) + 1}",
+            text=f"{abs(current[0] - start[0]) + 1} × {abs(current[1] - start[1]) + 1}",
             fill="#fff7f3",
             font=("Segoe UI", 12, "bold"),
             tags="sel",
         )
 
-    def release(self, event):
+    def release(self, _event=None):
         if self.finished or self.start is None:
             return
-        end = self._point(event)
+        self._complete(self._pointer())
+
+    def _complete(self, end):
+        if self.finished or self.start is None:
+            return
         rect = normalize_rect(self.start[0], self.start[1], end[0], end[1])
         self.start = None
         if rect is not None:
-            rect = clamp_rect(*rect, (0, 0, self.img_w, self.img_h))
+            rect = clamp_rect(*rect, self.bounds)
         if rect is None:
             self.canvas.delete("sel")
             return
-        self._finish_crop(rect)
-
-    def _finish_crop(self, rect):
-        if self.finished:
-            return
         self.finished = True
-        try:
-            x, y, width, height = rect
-            cropped = crop_rgb(self.rgb, self.img_w, self.img_h, x, y, width, height)
-        except Exception:
-            self._close()
-            self.on_cancel()
-            return
         self._close()
-        self.on_done(cropped, width, height)
+        if not accept_capture(rect, self.bounds):
+            self.on_cancel("Arraste só uma parte da tela, não a tela inteira.")
+            return
+        self.on_done(rect)
 
     def cancel(self, _event=None):
         if self.finished:
             return
         self.finished = True
         self._close()
-        self.on_cancel()
+        self.on_cancel("Recorte cancelado.")
 
     def _close(self):
-        self.rgb = b""
+        try:
+            self.win.attributes("-alpha", 0)
+            self.win.withdraw()
+            self.win.update_idletasks()
+        except tk.TclError:
+            pass
         try:
             self.win.grab_release()
         except tk.TclError:
             pass
-        self.win.destroy()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
 
 class BookApp:
@@ -854,19 +1112,23 @@ class BookApp:
         self.snipping = False
         self.saving = False
         self.overlay = None
+        self.saved_geometry = None
+        self.pending_rect = None
         self.last_width = 0
         self.resize_job = None
         self.delete_buttons = []
         self.fonts = choose_fonts(root)
+        self.watcher = ScreenshotWatch(lambda: screenshot_directories())
         root.title("Livro de prints")
         root.configure(bg=BG)
         self._build()
         place_book(root)
-        self.set_status("Recortar cobre a tela. Arraste um retângulo; ele entra no fim da pilha.")
+        self.set_status("Recortar escurece a tela. Arraste um retângulo; só essa área entra na pilha.")
         self.sync()
         root.bind("<Configure>", self._on_root_configure)
         root.bind_all("<MouseWheel>", self._on_wheel)
         root.after(80, self.render)
+        root.after(400, self._poll_screenshots)
 
     def _build(self):
         header = tk.Frame(self.root, bg=BG2)
@@ -986,7 +1248,7 @@ class BookApp:
         card.pack(fill="x", padx=18, pady=28)
         tk.Label(
             card,
-            text="Nenhum print ainda. Use Recortar e arraste um retângulo na tela.",
+            text="Nenhum print ainda. Arraste um retângulo com Recortar, ou salve um print na pasta Screenshots.",
             bg=PAPER,
             fg="#3a3128",
             font=self.fonts["serif_small"],
@@ -1035,6 +1297,23 @@ class BookApp:
         else:
             self.set_status("Print excluído.")
 
+    def _screen_bounds(self):
+        if os.name == "nt":
+            try:
+                return virtual_screen()
+            except OSError:
+                pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _append_shot(self, rgb: bytes, width: int, height: int) -> bool:
+        if not accept_capture((0, 0, width, height), self._screen_bounds()):
+            return False
+        if len(rgb) != width * height * 3:
+            return False
+        self.seq += 1
+        self.shots.append(Shot(self.seq, width, height, rgb))
+        return True
+
     def recortar(self):
         if self.snipping or self.saving:
             return
@@ -1042,43 +1321,49 @@ class BookApp:
             self.set_status("O recorte da tela só funciona no Windows.")
             return
         self.snipping = True
+        self.saved_geometry = self.root.geometry()
         self.sync()
-        self.set_status("A preparar o recorte…")
-        self.root.withdraw()
-        self.root.update_idletasks()
-        self.root.after(CAPTURE_SETTLE_MS, self._open_overlay)
-
-    def _open_overlay(self):
+        self.set_status("Arraste um retângulo. Esc cancela.")
         try:
-            origin_x, origin_y, rgb, width, height = capture_screen()
-            self.overlay = SnipOverlay(
-                self.root,
-                rgb,
-                width,
-                height,
-                (origin_x, origin_y),
-                self._on_crop,
-                self._on_cancel,
-            )
+            self.overlay = SnipOverlay(self.root, self._screen_bounds(), self._on_rect, self._on_cancel)
+        except Exception as exc:
+            print(f"recorte falhou: {exc}", file=sys.stderr)
+            self._end_snip("Não foi possível iniciar o recorte.")
+
+    def _on_rect(self, rect):
+        self.overlay = None
+        self.pending_rect = rect
+        self.root.after(CAPTURE_SETTLE_MS, self._grab_rect)
+
+    def _grab_rect(self):
+        rect = self.pending_rect
+        self.pending_rect = None
+        bounds = self._screen_bounds()
+        if not accept_capture(rect, bounds):
+            self._end_snip("Arraste só uma parte da tela, não a tela inteira.")
+            return
+        x, y, width, height = rect
+        try:
+            rgb, width, height = capture_rect(x, y, width, height)
         except Exception as exc:
             print(f"captura falhou: {exc}", file=sys.stderr)
-            self._end_snip()
-            self.set_status("Não foi possível capturar a tela.")
-
-    def _on_crop(self, rgb: bytes, width: int, height: int):
-        self.seq += 1
-        self.shots.append(Shot(self.seq, width, height, rgb))
-        self._end_snip()
+            self._end_snip("Não foi possível capturar essa área.")
+            return
+        if not self._append_shot(rgb, width, height):
+            self._end_snip("Arraste só uma parte da tela, não a tela inteira.")
+            return
+        self._end_snip(f"Print {len(self.shots)} guardado no fim da pilha.")
         self.render(scroll="end")
-        self.set_status(f"Print {len(self.shots)} guardado no fim da pilha.")
 
-    def _on_cancel(self):
-        self._end_snip()
-        self.set_status("Recorte cancelado.")
+    def _on_cancel(self, message="Recorte cancelado."):
+        self.pending_rect = None
+        self._end_snip(message)
 
-    def _end_snip(self):
+    def _end_snip(self, message: str):
         self.snipping = False
         self.overlay = None
+        if self.saved_geometry:
+            self.root.geometry(self.saved_geometry)
         self.root.deiconify()
         self.root.lift()
         try:
@@ -1087,6 +1372,42 @@ class BookApp:
             pass
         self.root.update_idletasks()
         self.sync()
+        self.set_status(message)
+
+    def _poll_screenshots(self):
+        try:
+            paths = self.watcher.poll()
+        except Exception as exc:
+            print(f"pasta de prints falhou: {exc}", file=sys.stderr)
+            paths = []
+        added = 0
+        ignored_full = False
+        bounds = self._screen_bounds()
+        for path in paths:
+            try:
+                rgb, width, height = load_image_file(path)
+            except Exception as exc:
+                print(f"ler print falhou: {path}: {exc}", file=sys.stderr)
+                self.watcher.retry_later(path)
+                continue
+            if is_whole_screen((0, 0, width, height), bounds):
+                ignored_full = True
+                continue
+            if not self._append_shot(rgb, width, height):
+                continue
+            added += 1
+        if added:
+            self.render(scroll="end")
+            if added == 1:
+                self.set_status("Print da pasta Screenshots guardado no fim da pilha.")
+            else:
+                self.set_status(f"{added} prints da pasta Screenshots entraram no fim da pilha.")
+        elif ignored_full:
+            self.set_status("Print da tela inteira ignorado.")
+        try:
+            self.root.after(500, self._poll_screenshots)
+        except tk.TclError:
+            return
 
     def baixar(self):
         if self.saving or self.snipping or not self.shots:

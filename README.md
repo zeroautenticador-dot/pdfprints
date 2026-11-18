@@ -4,7 +4,7 @@ O primeiro print fica no topo. Cada um seguinte entra logo abaixo.
 
 ## No Windows
 
-O livro abre à direita. Deixe o telefone espelhado à esquerda. Recortar cobre a tela. Arraste um retângulo em qualquer lugar, inclusive na janela do telefone. O recorte entra no fim da pilha. Baixar PDF grava essa ordem, o primeiro em cima.
+O livro abre à direita e fica lá. Deixe o telefone espelhado à esquerda. Recortar escurece a tela. Arraste um retângulo com o mouse; ao soltar, só essa área entra no fim da pilha, nunca a tela inteira. Esc cancela. Prints novos em `Pictures\Screenshots` e, se existir, em `OneDrive\Pictures\Screenshots` entram sozinhos, na ordem em que chegam. Baixar PDF grava essa ordem, o primeiro em cima.
 
 Na pasta deste repositório:
 
