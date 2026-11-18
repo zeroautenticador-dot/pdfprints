@@ -14,19 +14,14 @@
       <h1>Livro de prints</h1>
       <p class="lead">O primeiro print fica no topo. Cada um seguinte entra logo abaixo.</p>
     </div>
-    <div class="live">
-      <video id="preview" muted autoplay playsinline disablepictureinpicture aria-label="Prévia da tela compartilhada"></video>
-      <p id="live-label">Nenhuma tela compartilhada</p>
-    </div>
     <div class="actions">
-      <button type="button" id="share" title="Escolher monitor ou janela">Compartilhar tela</button>
-      <button type="button" id="shoot" title="Acrescentar o quadro atual no fim" disabled>Tirar print</button>
+      <button type="button" id="shoot" title="Escolher uma área da tela">Tirar print</button>
       <button type="button" id="save" title="Baixar um PDF na ordem da pilha" disabled>Baixar PDF</button>
     </div>
     <p id="status" class="status" role="status"></p>
   </header>
   <main id="stack" class="stack" tabindex="-1" aria-label="Pilha de prints">
-    <p class="empty">Nenhum print ainda. Use Compartilhar tela e depois Tirar print.</p>
+    <p class="empty">Nenhum print ainda. Use Tirar print e arraste um retângulo.</p>
   </main>
   <script src="app.js"></script>
 </body>

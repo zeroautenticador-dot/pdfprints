@@ -3,20 +3,25 @@
 const PAGE_WIDTH = 595.28;
 const MAX_PAGE_HEIGHT = 14400;
 
-const shareBtn = document.querySelector("#share");
 const shootBtn = document.querySelector("#shoot");
 const saveBtn = document.querySelector("#save");
 const stackEl = document.querySelector("#stack");
 const statusEl = document.querySelector("#status");
 const countEl = document.querySelector("#count");
-const preview = document.querySelector("#preview");
-const liveLabel = document.querySelector("#live-label");
+const frameVideo = document.createElement("video");
+frameVideo.muted = true;
+frameVideo.autoplay = true;
+frameVideo.playsInline = true;
+frameVideo.hidden = true;
+document.body.append(frameVideo);
 
 let stream = null;
 let shots = [];
 let seq = 1;
 let shooting = false;
 let saving = false;
+let picking = false;
+let picker = null;
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -31,19 +36,9 @@ function isLive() {
 }
 
 function updateControls() {
-  const live = isLive();
-  document.body.classList.toggle("is-live", live);
-  shareBtn.setAttribute("aria-pressed", live ? "true" : "false");
-  shootBtn.disabled = !live || shooting;
+  shootBtn.disabled = shooting || picking;
   saveBtn.disabled = shots.length === 0 || saving;
   countEl.textContent = `Caderno · ${printsLabel(shots.length)}`;
-  if (!live) {
-    liveLabel.textContent = "Nenhuma tela compartilhada";
-    return;
-  }
-  const width = preview.videoWidth;
-  const height = preview.videoHeight;
-  liveLabel.textContent = width && height ? `Tela ativa · ${width}×${height}` : "Tela ativa";
 }
 
 function render({ scroll = false } = {}) {
@@ -52,7 +47,7 @@ function render({ scroll = false } = {}) {
     stackEl.replaceChildren();
     const empty = document.createElement("p");
     empty.className = "empty";
-    empty.textContent = "Nenhum print ainda. Use Compartilhar tela e depois Tirar print.";
+    empty.textContent = "Nenhum print ainda. Use Tirar print e arraste um retângulo.";
     stackEl.append(empty);
     return;
   }
@@ -120,7 +115,7 @@ function releaseStream() {
   stream = null;
   if (!current) return;
   for (const track of current.getTracks()) track.stop();
-  if (preview.srcObject === current) preview.srcObject = null;
+  if (frameVideo.srcObject === current) frameVideo.srcObject = null;
 }
 
 function attachStream(next) {
@@ -129,90 +124,257 @@ function attachStream(next) {
   if (previous) {
     for (const track of previous.getTracks()) track.stop();
   }
-  preview.srcObject = next;
+  frameVideo.srcObject = next;
   const finish = () => {
     if (stream !== next) return;
     if (next.getVideoTracks().some((item) => item.readyState === "live")) return;
     releaseStream();
+    closePicker();
     updateControls();
-    setStatus("Compartilhamento encerrado.");
+    setStatus("A tela foi encerrada. Tire um print para escolher de novo.");
   };
   next.addEventListener("inactive", finish);
   const track = next.getVideoTracks()[0];
   if (track) track.addEventListener("ended", finish);
-  preview.play().catch(() => {});
+  frameVideo.play().catch(() => {});
   updateControls();
 }
 
-async function share() {
+async function ensureCapture() {
+  if (isLive()) return true;
   if (!window.isSecureContext) {
-    setStatus("Abra esta página em HTTPS para compartilhar a tela.");
-    return;
+    setStatus("Abra esta página em HTTPS para tirar um print.");
+    return false;
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-    setStatus("Este navegador não compartilha a tela.");
-    return;
+    setStatus("Este navegador não permite tirar um print da tela.");
+    return false;
   }
-  shareBtn.disabled = true;
   try {
     const next = await navigator.mediaDevices.getDisplayMedia({
       video: true,
       audio: false
     });
     attachStream(next);
-    setStatus("Tela compartilhada. Tire um print quando quiser.");
+    return isLive();
   } catch (err) {
     const name = err && err.name;
     if (name === "NotAllowedError" || name === "AbortError") {
-      setStatus(isLive() ? "A tela anterior continua compartilhada." : "Compartilhamento cancelado.");
+      setStatus(isLive() ? "A tela anterior continua ativa." : "Print cancelado.");
     } else {
-      setStatus("Não foi possível compartilhar a tela.");
+      setStatus("Não foi possível acessar a tela.");
     }
-  } finally {
-    shareBtn.disabled = false;
-    updateControls();
+    return false;
   }
 }
 
-async function shoot() {
-  if (shooting || !isLive()) {
-    if (!isLive()) setStatus("Compartilhe a tela antes de tirar um print.");
-    return;
+function waitForFrame() {
+  if (frameVideo.videoWidth && frameVideo.videoHeight) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      frameVideo.removeEventListener("resize", ready);
+      frameVideo.removeEventListener("loadeddata", ready);
+      reject(new Error("frame"));
+    }, 4000);
+    const ready = () => {
+      if (!frameVideo.videoWidth || !frameVideo.videoHeight) return;
+      window.clearTimeout(timer);
+      frameVideo.removeEventListener("resize", ready);
+      frameVideo.removeEventListener("loadeddata", ready);
+      resolve();
+    };
+    frameVideo.addEventListener("resize", ready);
+    frameVideo.addEventListener("loadeddata", ready);
+  });
+}
+
+function grabFrame() {
+  const width = frameVideo.videoWidth;
+  const height = frameVideo.videoHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  ctx.drawImage(frameVideo, 0, 0, width, height);
+  return canvas;
+}
+
+async function storeCanvas(canvas) {
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((result) => {
+      if (result) resolve(result);
+      else reject(new Error("blob"));
+    }, "image/jpeg", 0.95);
+  });
+  if (blob.type !== "image/jpeg") throw new Error("tipo");
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("jpeg");
+  const url = URL.createObjectURL(blob);
+  shots.push({ id: seq++, url, width: canvas.width, height: canvas.height, bytes });
+  render({ scroll: true });
+}
+
+function closePicker() {
+  if (picker) {
+    if (picker.cleanup) picker.cleanup();
+    picker.remove();
+    picker = null;
   }
-  const width = preview.videoWidth;
-  const height = preview.videoHeight;
-  if (!width || !height) {
+  picking = false;
+}
+
+function pointOnFrame(event, view, frame) {
+  const bounds = view.getBoundingClientRect();
+  if (!bounds.width || !bounds.height) return null;
+  const x = ((event.clientX - bounds.left) * frame.width) / bounds.width;
+  const y = ((event.clientY - bounds.top) * frame.height) / bounds.height;
+  return {
+    x: Math.min(frame.width, Math.max(0, x)),
+    y: Math.min(frame.height, Math.max(0, y))
+  };
+}
+
+function openPicker(frame) {
+  closePicker();
+  picking = true;
+  updateControls();
+  const overlay = document.createElement("div");
+  overlay.className = "picker";
+  overlay.tabIndex = -1;
+  const stage = document.createElement("div");
+  stage.className = "picker-stage";
+  const view = document.createElement("canvas");
+  view.className = "picker-view";
+  view.width = frame.width;
+  view.height = frame.height;
+  view.getContext("2d").drawImage(frame, 0, 0);
+  const box = document.createElement("div");
+  box.className = "picker-box";
+  box.hidden = true;
+  const hint = document.createElement("p");
+  hint.className = "picker-hint";
+  hint.textContent = "Arraste um retângulo · Esc cancela";
+  stage.append(view, box);
+  overlay.append(stage, hint);
+  document.body.append(overlay);
+  overlay.focus();
+  picker = overlay;
+
+  let start = null;
+  let dragging = false;
+  let settled = false;
+
+  const drawBox = (a, b) => {
+    const bounds = view.getBoundingClientRect();
+    const stageBounds = stage.getBoundingClientRect();
+    const left = (Math.min(a.x, b.x) / frame.width) * bounds.width;
+    const top = (Math.min(a.y, b.y) / frame.height) * bounds.height;
+    const width = (Math.abs(b.x - a.x) / frame.width) * bounds.width;
+    const height = (Math.abs(b.y - a.y) / frame.height) * bounds.height;
+    box.hidden = false;
+    box.style.left = `${bounds.left - stageBounds.left + left}px`;
+    box.style.top = `${bounds.top - stageBounds.top + top}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+  };
+
+  const onKey = (event) => {
+    if (event.key !== "Escape" || settled) return;
+    event.preventDefault();
+    closePicker();
+    updateControls();
+    setStatus("Print cancelado.");
+  };
+
+  const onDown = (event) => {
+    if (settled || event.button !== 0) return;
+    const point = pointOnFrame(event, view, frame);
+    if (!point) return;
+    dragging = true;
+    start = point;
+    overlay.setPointerCapture(event.pointerId);
+    drawBox(start, start);
+    event.preventDefault();
+  };
+
+  const onMove = (event) => {
+    if (!dragging || !start || settled) return;
+    const point = pointOnFrame(event, view, frame);
+    if (!point) return;
+    drawBox(start, point);
+  };
+
+  const finish = async (event) => {
+    if (settled || !dragging || !start) return;
+    dragging = false;
+    const end = pointOnFrame(event, view, frame);
+    if (!end) return;
+    const x = Math.round(Math.min(start.x, end.x));
+    const y = Math.round(Math.min(start.y, end.y));
+    const width = Math.round(Math.abs(end.x - start.x));
+    const height = Math.round(Math.abs(end.y - start.y));
+    start = null;
+    if (width < 8 || height < 8) {
+      box.hidden = true;
+      return;
+    }
+    const sx = Math.max(0, Math.min(frame.width - 1, x));
+    const sy = Math.max(0, Math.min(frame.height - 1, y));
+    const sw = Math.max(1, Math.min(frame.width - sx, width));
+    const sh = Math.max(1, Math.min(frame.height - sy, height));
+    settled = true;
+    closePicker();
+    const crop = document.createElement("canvas");
+    crop.width = sw;
+    crop.height = sh;
+    const ctx = crop.getContext("2d", { alpha: false });
+    ctx.drawImage(frame, sx, sy, sw, sh, 0, 0, sw, sh);
+    shooting = true;
+    updateControls();
+    setStatus("A capturar…");
+    try {
+      await storeCanvas(crop);
+      setStatus(`Print ${shots.length} guardado no fim da pilha.`);
+    } catch (err) {
+      setStatus("Não foi possível guardar este print.");
+    } finally {
+      shooting = false;
+      updateControls();
+    }
+  };
+
+  overlay.addEventListener("pointerdown", onDown);
+  overlay.addEventListener("pointermove", onMove);
+  overlay.addEventListener("pointerup", finish);
+  overlay.addEventListener("pointercancel", () => {
+    dragging = false;
+    start = null;
+    box.hidden = true;
+  });
+  document.addEventListener("keydown", onKey);
+  overlay.cleanup = () => document.removeEventListener("keydown", onKey);
+  setStatus("Arraste um retângulo na imagem. Esc cancela.");
+}
+
+async function tirarPrint() {
+  if (picking || shooting) return;
+  if (!isLive()) {
+    const ok = await ensureCapture();
+    if (!ok) return;
+  }
+  try {
+    await frameVideo.play().catch(() => {});
+    await waitForFrame();
+  } catch (err) {
     setStatus("A imagem da tela ainda não chegou. Tente de novo.");
     return;
   }
-  shooting = true;
-  updateControls();
-  setStatus("A capturar…");
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d", { alpha: false });
-    ctx.drawImage(preview, 0, 0, width, height);
-    const blob = await new Promise((resolve, reject) => {
-      canvas.toBlob((result) => {
-        if (result) resolve(result);
-        else reject(new Error("blob"));
-      }, "image/jpeg", 0.95);
-    });
-    if (blob.type !== "image/jpeg") throw new Error("tipo");
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("jpeg");
-    const url = URL.createObjectURL(blob);
-    shots.push({ id: seq++, url, width, height, bytes });
-    render({ scroll: true });
-    setStatus(`Print ${shots.length} guardado no fim da pilha.`);
-  } catch (err) {
-    setStatus("Não foi possível guardar este print.");
-  } finally {
-    shooting = false;
-    updateControls();
+  const frame = grabFrame();
+  if (!frame.width || !frame.height) {
+    setStatus("A imagem da tela ainda não chegou. Tente de novo.");
+    return;
   }
+  openPicker(frame);
 }
 
 function fmt(value) {
@@ -415,18 +577,14 @@ async function savePdf() {
   }
 }
 
-shareBtn.addEventListener("click", () => {
-  share();
-});
 shootBtn.addEventListener("click", () => {
-  shoot();
+  tirarPrint();
 });
 saveBtn.addEventListener("click", () => {
   savePdf();
 });
-preview.addEventListener("resize", updateControls);
 
 if (!window.isSecureContext) {
-  setStatus("Abra esta página em HTTPS para compartilhar a tela.");
+  setStatus("Abra esta página em HTTPS para tirar um print.");
 }
 updateControls();

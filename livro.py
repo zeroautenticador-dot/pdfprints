@@ -1123,7 +1123,7 @@ class BookApp:
         root.configure(bg=BG)
         self._build()
         place_book(root)
-        self.set_status("Recortar escurece a tela. Arraste um retângulo; só essa área entra na pilha.")
+        self.set_status("Tirar print mostra a mira. Arraste um retângulo; só essa área entra na pilha.")
         self.sync()
         root.bind("<Configure>", self._on_root_configure)
         root.bind_all("<MouseWheel>", self._on_wheel)
@@ -1163,7 +1163,7 @@ class BookApp:
         self.lead.pack(anchor="w", padx=18, pady=(4, 0))
         actions = tk.Frame(header, bg=BG2)
         actions.pack(anchor="w", padx=18, pady=(12, 0))
-        self.shoot = tk.Button(actions, text="Recortar", command=self.recortar)
+        self.shoot = tk.Button(actions, text="Tirar print", command=self.tirar_print)
         _style_button(self.shoot, CREAM, INK, self.fonts["sans"])
         self.shoot.pack(side="left")
         self.save = tk.Button(actions, text="Baixar PDF", command=self.baixar)
@@ -1248,7 +1248,7 @@ class BookApp:
         card.pack(fill="x", padx=18, pady=28)
         tk.Label(
             card,
-            text="Nenhum print ainda. Arraste um retângulo com Recortar, ou salve um print na pasta Screenshots.",
+            text="Nenhum print ainda. Use Tirar print e arraste um retângulo, ou salve um print na pasta Screenshots.",
             bg=PAPER,
             fg="#3a3128",
             font=self.fonts["serif_small"],
@@ -1314,11 +1314,11 @@ class BookApp:
         self.shots.append(Shot(self.seq, width, height, rgb))
         return True
 
-    def recortar(self):
+    def tirar_print(self):
         if self.snipping or self.saving:
             return
         if os.name != "nt":
-            self.set_status("O recorte da tela só funciona no Windows.")
+            self.set_status("Tirar print da tela só funciona no Windows.")
             return
         self.snipping = True
         self.saved_geometry = self.root.geometry()
@@ -1327,8 +1327,8 @@ class BookApp:
         try:
             self.overlay = SnipOverlay(self.root, self._screen_bounds(), self._on_rect, self._on_cancel)
         except Exception as exc:
-            print(f"recorte falhou: {exc}", file=sys.stderr)
-            self._end_snip("Não foi possível iniciar o recorte.")
+            print(f"print falhou: {exc}", file=sys.stderr)
+            self._end_snip("Não foi possível iniciar o print.")
 
     def _on_rect(self, rect):
         self.overlay = None
